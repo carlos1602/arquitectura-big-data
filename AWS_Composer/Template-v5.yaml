@@ -1,0 +1,486 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Implementación de la arquitectura mostrada en el diagrama con
+  servicios de seguridad y AWS Cloud en mx-central-1
+
+Parameters:
+  VpcCidr:
+    Description: CIDR block for the VPC
+    Type: String
+    Default: 10.0.0.0/16
+  SubnetCidr:
+    Description: CIDR block for the subnet
+    Type: String
+    Default: 10.0.3.0/24
+
+Resources:
+  # Seguridad y gobernanza
+  KMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: Key for encryption
+      KeyPolicy:
+        Version: '2012-10-17'
+        Id: key-default-1
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action: kms:*
+            Resource: '*'
+
+  CloudTrail:
+    Type: AWS::CloudTrail::Trail
+    Properties:
+      IsLogging: true
+      S3BucketName: !Ref CloudTrailBucket
+      IncludeGlobalServiceEvents: true
+    DependsOn: CloudTrailBucketPolicy
+
+  CloudTrailBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub cloudtrail-bucket-${AWS::AccountId}
+      AccessControl: Private
+
+  CloudTrailBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref CloudTrailBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !Sub arn:aws:s3:::${CloudTrailBucket}
+          - Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub arn:aws:s3:::${CloudTrailBucket}/AWSLogs/${AWS::AccountId}/*
+            Condition:
+              StringEquals:
+                s3:x-amz-acl: bucket-owner-full-control
+
+  CloudWatchLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: AWSCloudTrail
+      RetentionInDays: 365
+
+  # Infraestructura mx-central-1
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: mx-central-1-vpc
+
+  Subnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref SubnetCidr
+      AvailabilityZone: !Select
+        - 0
+        - !GetAZs ''
+      Tags:
+        - Key: Name
+          Value: mx-central-1-subnet
+
+  DynamoDBTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: ApplicationTable
+      AttributeDefinitions:
+        - AttributeName: ID
+          AttributeType: S
+      KeySchema:
+        - AttributeName: ID
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+
+  AuroraCluster:
+    Type: AWS::RDS::DBCluster
+    Properties:
+      Engine: aurora-postgresql
+      DatabaseName: ApplicationDB
+      MasterUsername: admin
+      MasterUserPassword: !Sub ${AWS::AccountId}-${AWS::Region}
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      StorageEncrypted: true
+      KmsKeyId: !Ref KMSKey
+      EnableHttpEndpoint: true
+
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Subnet group for Aurora
+      SubnetIds:
+        - !Ref Subnet
+
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub static-website-${AWS::AccountId}
+      WebsiteConfiguration:
+        IndexDocument: index.html
+        ErrorDocument: error.html
+      AccessControl: PublicRead
+
+  GlacierVault:
+    Type: AWS::Glacier::Vault
+    Properties:
+      VaultName: RawZoneVault
+      AccessPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action: glacier:UploadArchive
+            Resource: !Sub arn:aws:glacier:${AWS::Region}:${AWS::AccountId}:vaults/RawZoneVault
+
+  KinesisStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      Name: DataStream
+      ShardCount: 1
+
+  RedshiftCluster:
+    Type: AWS::Redshift::Cluster
+    Properties:
+      ClusterIdentifier: analytics-cluster
+      NodeType: dc2.large
+      MasterUsername: admin
+      MasterUserPassword: !Sub ${AWS::AccountId}-${AWS::Region}
+      DBName: analytics
+      ClusterSubnetGroupName: !Ref RedshiftSubnetGroup
+      PubliclyAccessible: false
+      Encrypted: true
+      KmsKeyId: !Ref KMSKey
+
+  RedshiftSubnetGroup:
+    Type: AWS::Redshift::ClusterSubnetGroup
+    Properties:
+      Description: Subnet group for Redshift
+      SubnetIds:
+        - !Ref Subnet
+
+  EKSCluster:
+    Type: AWS::EKS::Cluster
+    Properties:
+      Name: application-cluster
+      ResourcesVpcConfig:
+        SubnetIds:
+          - !Ref Subnet
+      RoleArn: !GetAtt EKSServiceRole.Arn
+
+  EKSServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: eks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSClusterPolicy
+
+  ALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: application-alb
+      Subnets:
+        - !Ref Subnet
+      Type: application
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for ALB
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+
+  LambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: application-function
+      Runtime: python3.9
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          def handler(event, context):
+              return {
+                  'statusCode': 200,
+                  'body': 'Hello from Lambda!'
+              }
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  APIGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: application-api
+      Description: API Gateway for application
+
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Origins:
+          - DomainName: !GetAtt S3Bucket.DomainName
+            Id: S3Origin
+            CustomOriginConfig:
+              HTTPPort: 80
+              HTTPSPort: 443
+              OriginProtocolPolicy: http-only
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          DefaultTTL: 86400
+          MaxTTL: 31536000
+          ForwardedValues:
+            QueryString: false
+            Cookies:
+              Forward: none
+        DefaultRootObject: index.html
+        PriceClass: PriceClass_100
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+  ResolverEndpoint:
+    Type: AWS::Route53Resolver::ResolverEndpoint
+    Properties:
+      IpAddresses:
+        - SubnetId: <String>
+      Direction: <String>
+      SecurityGroupIds:
+        - <String>
+  Group:
+    Type: AWS::IAM::Group
+    Properties: {}
+  AccessKey:
+    Type: AWS::IAM::AccessKey
+    Properties:
+      UserName: <String>
+  GroupPolicy:
+    Type: AWS::IAM::GroupPolicy
+    Properties:
+      GroupName: <String>
+      PolicyName: <String>
+  ManagedPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument: <Json>
+  Agent:
+    Type: AWS::Bedrock::Agent
+    Properties:
+      AgentName: <String>
+  Studio:
+    Type: AWS::EMR::Studio
+    Properties:
+      WorkspaceSecurityGroupId: <String>
+      DefaultS3Location: <String>
+      SubnetIds:
+        - <String>
+      Name: <String>
+      ServiceRole: <String>
+      VpcId: <String>
+      EngineSecurityGroupId: <String>
+      AuthMode: <String>
+  Analysis:
+    Type: AWS::QuickSight::Analysis
+    Properties:
+      Name: <String>
+      AnalysisId: <String>
+      AwsAccountId: <String>
+  Dashboard:
+    Type: AWS::QuickSight::Dashboard
+    Properties:
+      DashboardId: <String>
+      Name: <String>
+      AwsAccountId: <String>
+  VPCConnection:
+    Type: AWS::QuickSight::VPCConnection
+    Properties: {}
+  PrincipalPermissions:
+    Type: AWS::LakeFormation::PrincipalPermissions
+    Properties:
+      Resource: {}
+      Permissions:
+        - <String>
+      Principal: {}
+      PermissionsWithGrantOption:
+        - <String>
+  Group2:
+    Type: AWS::XRay::Group
+    Properties:
+      GroupName: <String>
+  ResourcePolicy:
+    Type: AWS::XRay::ResourcePolicy
+    Properties:
+      PolicyName: <String>
+      PolicyDocument: <String>
+  FargateProfile:
+    Type: AWS::EKS::FargateProfile
+    Properties:
+      ClusterName: <String>
+      PodExecutionRoleArn: <String>
+      Selectors:
+        - Namespace: <String>
+  DBSecurityGroup:
+    Type: AWS::RDS::DBSecurityGroup
+    Properties:
+      DBSecurityGroupIngress:
+        - {}
+      GroupDescription: <String>
+  Cluster:
+    Type: AWS::EMR::Cluster
+    Properties:
+      Instances: {}
+      JobFlowRole: <String>
+      Name: <String>
+      ServiceRole: <String>
+  SecurityConfiguration:
+    Type: AWS::EMR::SecurityConfiguration
+    Properties:
+      SecurityConfiguration: <Json>
+  DBCluster:
+    Type: AWS::Neptune::DBCluster
+    Properties: {}
+  Broker:
+    Type: AWS::AmazonMQ::Broker
+    Properties:
+      HostInstanceType: <String>
+      Users:
+        - Username: <String>
+          Password: <String>
+      BrokerName: <String>
+      DeploymentMode: <String>
+      EngineType: <String>
+      PubliclyAccessible: <Boolean>
+  Queue:
+    Type: AWS::SQS::Queue
+    Properties: {}
+  Instance:
+    Type: AWS::EC2::Instance
+    Properties: {}
+
+Outputs:
+  VPCId:
+    Description: ID of the VPC
+    Value: !Ref VPC
+    Export:
+      Name: !Sub ${AWS::StackName}-VPCID
+  StaticWebsiteURL:
+    Description: URL of the static website
+    Value: !GetAtt S3Bucket.WebsiteURL
+  APIGatewayEndpoint:
+    Description: API Gateway endpoint
+    Value: !Sub https://${APIGateway}.execute-api.${AWS::Region}.amazonaws.com/prod
+Metadata:
+  AWS::Composer::Groups:
+    Group3:
+      Label: Gobernanza y Seguridad
+      Members:
+        - AccessKey
+        - CloudTrail
+        - CloudWatchLogGroup
+        - Group4
+        - KMSKey
+        - Group13
+    Group4:
+      Label: IAM - Administracion de identidades
+      Members:
+        - Group
+        - GroupPolicy
+        - ManagedPolicy
+    Group5:
+      Label: Data lake
+      Members:
+        - DBSubnetGroup
+        - DBSecurityGroup
+        - DynamoDBTable
+        - DBCluster
+        - Broker
+    Group6:
+      Label: LoadBalancer
+      Members:
+        - ALBSecurityGroup
+        - EKSServiceRole
+        - LambdaExecutionRole
+        - FargateProfile
+        - Instance
+    Group7:
+      Label: 'Datawarehouse - Herramientas BI '
+      Members:
+        - RedshiftSubnetGroup
+        - RedshiftCluster
+        - Group8
+        - Agent
+        - VPCConnection
+        - PrincipalPermissions
+        - Group12
+    Group8:
+      Label: Amazon Quicksight
+      Members:
+        - Analysis
+        - Dashboard
+    Group9:
+      Label: Grupo de entrada a la red
+      Members:
+        - ALB
+        - KinesisStream
+        - APIGateway
+        - Queue
+    Group10:
+      Label: Interfaz de usuarios -  Website
+      Members:
+        - CloudFrontDistribution
+        - ResolverEndpoint
+    Group11:
+      Label: Almacenamiento en disco
+      Members:
+        - S3Bucket
+        - GlacierVault
+        - CloudTrailBucket
+    Group12:
+      Label: Amazon EMR - Apache Spark (antiguo Sagemaker))
+      Members:
+        - Cluster
+        - Studio
+        - SecurityConfiguration
+    Group13:
+      Label: AWS XRAY
+      Members:
+        - ResourcePolicy
+        - Group2
