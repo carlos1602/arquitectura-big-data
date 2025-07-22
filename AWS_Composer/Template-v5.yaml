@@ -133,18 +133,6 @@ Resources:
         ErrorDocument: error.html
       AccessControl: PublicRead
 
-  GlacierVault:
-    Type: AWS::Glacier::Vault
-    Properties:
-      VaultName: RawZoneVault
-      AccessPolicy:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal: '*'
-            Action: glacier:UploadArchive
-            Resource: !Sub arn:aws:glacier:${AWS::Region}:${AWS::AccountId}:vaults/RawZoneVault
-
   KinesisStream:
     Type: AWS::Kinesis::Stream
     Properties:
